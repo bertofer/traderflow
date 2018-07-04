@@ -7,12 +7,13 @@
 
 (defn handlers
   [ch]
-  {:on-receive (fn [data] (go (>! ch {:type :on-receive
-                                      :data (json/parse-string data true)})))
-   :on-connect (fn [_] (go (>! ch {:type :on-connect})))
-   :on-error (fn [err] (go (>! ch {:type :on-error
-                                   :err err})))
-   :on-close (fn [s d] (go (>! ch {:type :on-close})))})
+  {:on-receive (fn [data] (go (>! ch [:on-receive (json/parse-string data true)])))
+
+   :on-connect (fn [_] (go (>! ch [:on-connect])))
+
+   :on-error (fn [err] (go (>! ch [:on-error err])))
+
+   :on-close (fn [s d] (go (>! ch [:on-close s d])))})
 
 (defprotocol WebSocketActions
   (connect [this])
@@ -25,7 +26,8 @@
     (let [new-conn (apply ws/connect url (flatten (into [] (handlers ch))))]
       (reset! conn new-conn)))
   (send-msg [this msg]
-    (ws/send-msg @conn (json/generate-string msg)))
+    (when-let [ws @conn]
+      (ws/send-msg ws (json/generate-string msg))))
   (close [this]
     (ws/close @conn)
     (reset! conn nil)))

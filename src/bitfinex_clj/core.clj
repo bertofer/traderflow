@@ -1,104 +1,107 @@
 (ns bitfinex-clj.core
   (:require [cheshire.core :as json]
             [clojure.spec.alpha :as spec]
-            [clojure.core.async :as async]
-            [bitfinex-clj.process :as process]
-            [bitfinex-clj.websocket :as ws]
-            [bitfinex-clj.subscriptions :as subs]
-            [bitfinex-clj.utils :as utils]))
+            [clojure.set :as set]
+            [clojure.core.async :as async :refer [go go-loop >! <! >!! <!! sub pipe]]))
 
-; ; Enable assertions for options
-(spec/check-asserts true)
 
-;;;; Public API specs
-(def channel-checker (utils/field-checker :channel))
-;; Config
-
-;; Subscriptions
+;; Spec common
 (spec/def ::symbol string?)
+(spec/def ::chan-id integer?)
 
-; Candlestick data
-(spec/def ::timeframe #{:1m :5m :15m :30m :1h :3h :6h :12h :1D :7D :14D :1M})
+;; Some utility functions & macros
+(defmacro kat [& ks]
+  "Version of spec/cat that uses the same keyword as key and predicate of returned map"
+  (let [ks' (mapcat #(repeat 2 %) ks)]
+    `(spec/cat ~@ks')))
 
-; Subscription options
-(spec/def ::channel #{:candles :ticker :trades :books})
-(spec/def ::common-sub (spec/keys :req-un [::channel]))
+(defmacro defentity
+  "Given an entity symbol and a vector of namespaced keys,
+  it defines a tuple spec with expanded keys and name ::[entity],
+  and defines a fn with name ->[entity] to transform data in the spec
+  format to a map with the same namespaced keys and values in data"
+  [entity ks]
+  `(do
+     (spec/def ~(keyword (str *ns*) (name entity)) (spec/tuple ~@ks))
+     (defn ~(symbol (str "->" (name entity)))
+       [data#]
+       (zipmap (map (comp keyword name) ~ks) data#))))
 
-(spec/def ::candles-sub (spec/merge ::common-sub
-                              (spec/keys :req-un [::symbol ::timeframe])))
-(spec/def ::ticker-sub (spec/merge ::common-sub
-                              (spec/keys :req-un [::symbol])))
-(spec/def ::trades-sub (spec/merge ::common-sub
-                              (spec/keys :req-un [::symbol])))
-(spec/def ::books-sub (spec/merge ::common-sub
-                            (spec/keys :req-un [::symbol]
-                                    :opt-un [::prec ::len ::freq])))
+(defn field-checker
+  [prop value]
+  (fn [msg] (= value (prop msg))))
 
-(spec/def ::subscription
-  (spec/or :candles (spec/and ::candles-sub
-                              (sp/channel-checker :candles))
+(defn find-key
+  [pred coll]
+  (some (fn [[k v]] (when (pred v) k)) coll))
 
-           :ticker (spec/and ::ticker-sub
-                             (sp/channel-checker :ticker))
+(defn filter-by
+  [prop v coll]
+  (filter #(= (prop (val %)) v) coll))
 
-           :trades (spec/and ::trades-sub
-                             (sp/channel-checker :trades))
+(defn subset?
+  [n m]
+  (set/subset? (set n) (set m)))
 
-           :books (spec/and ::books-sub
-                            (sp/channel-checker :books))))
+(defn is-valid?
+  [spec data]
+  (spec/valid? spec data))
 
+(defn filter-spec
+  [spec]
+  (filter (partial is-valid? spec)))
 
-;;;; Public API
-(defn subscribe
-  ([client opts]
-   {:pre [(spec/assert ::subscription opts)]}
-   (async/>!! (:in client)
-              {:type :subscribe
-               :data (subs/add-defaults opts)}))
-  ([client opts ch]
-   nil))
+(defn public-msg->data
+  [inc]
+  (last inc))
 
-(defn unsubscribe
-  [client opts]
-  {:pre [(spec/assert ::subscription opts)]}
-  (async/>!! (:in client)
-             {:type :unsubscribe
-              :data (subs/add-defaults opts)}))
+(defn ->entity-snapshot
+  [entity snapshot]
+  (map entity snapshot))
 
-(defn connect [{:keys [in]}]
-  (async/>!! in {:type :connect}))
+(defn log-xf [prefix]
+  (fn [xf]
+    (fn
+      ([] (xf))
+      ([r] (xf r))
+      ([r i] (prn prefix) (prn i) (xf r i)))))
 
-(defn close [{:keys [in]}]
-  (async/>!! in {:type :close}))
+(defn sub-pipe
+  ([p t from to]
+   (sub-pipe p t from to true))
+  ([p t from to close?]
+   (sub p t from true)
+   (pipe from to close?)))
 
-(defn client
-  ([]
-   (client {}))
-  ([config]
-   (let [in (async/chan 100)
-         out (async/chan)
-         wsclient (ws/new-websocket-client in)]
-     ; (async/go (async/>! (:user-actions chs) {:type :connect}))
-     {:in in
-      :out out
-      :out-put (async/pub out :channel)
-      :io-loop (proc/process-loop in out wsclient)}))
+(defn is-funding?
+  [symbol]
+  (= (first symbol) \f))
 
-  ([config ch]))
-   ;; Subscribe all config to ch after getting client
+(defn is-trading?
+  [symbol]
+  (= (first symbol) \t))
 
-; (def x (client))
-;
-; (connect x)
-; (subscribe x {:channel :candles :symbol "BTCUSD" :timeframe :1m})
-; (close x)
+(defn can-send?
+  [{:keys [ws-connected? ws-maintenance?]}]
+  (and ws-connected? (not ws-maintenance?)))
 
-;; Public api
-;; - subscribe -> no sub in message out? -> send also subscription details?
-;; - unsubscribe -> nothing, maybe confirmation of unsub.
-;; - snapshot (?) ->
-;; Auth api
-;; - subscribe -> no sub in message out?
-;; - new-order, update-order, cancel-order, cancel-order-multi, order-multi-op
-;; - calc
-;; - new-offer
+(defn ->subscription
+  "Creates a subscribe message"
+  [channel opts]
+  (merge {:channel channel} opts))
+
+;; process main functions: event-handler and effect-handler
+(defmulti effect-handler (fn [fx deps] (first fx)))
+
+(defmulti event-handler (fn [cofx in] (first in)))
+
+;; loop
+(defn process-loop
+  [{:keys [queue fx-deps cofx-fn]}]
+  (go-loop []
+    (if-let [in (<! queue)]
+      (do (prn (first in))
+          (let [effects (event-handler (cofx-fn) in)]
+            (doseq [fx effects]
+              (effect-handler fx fx-deps))
+            (recur))))))
